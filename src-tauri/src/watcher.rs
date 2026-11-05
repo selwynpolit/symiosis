@@ -12,6 +12,7 @@ use crate::{
     services::note_service::update_note_in_database,
     utilities::file_safety::{create_versioned_backup, BackupType},
     utilities::fs_meta::file_modified_secs,
+    utilities::paths::note_key,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -379,7 +380,7 @@ fn process_file_paths(
     for path in paths {
         match path.strip_prefix(canonical_notes_dir) {
             Ok(relative) => {
-                let filename = relative.to_string_lossy().to_string();
+                let filename = note_key(relative);
 
                 if should_ignore_file(&filename) {
                     continue;

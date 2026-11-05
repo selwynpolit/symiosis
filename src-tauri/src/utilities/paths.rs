@@ -171,3 +171,52 @@ pub fn get_temp_dir() -> AppResult<PathBuf> {
         .ok_or_else(|| AppError::ConfigLoad("Failed to get data directory".to_string()))
         .map(|path| path.join("symiosis").join("temp"))
 }
+
+/// Rewrites `\` as `/`, the one separator note names use.
+pub fn normalize_separators(relative: &str) -> String {
+    relative.replace('\\', "/")
+}
+
+/// The name a note is known by in the index and in every command: its path
+/// relative to the notes directory, always with `/` between folders.
+///
+/// On Windows a relative path has `\` in it, and `validate_note_name` rejects
+/// `\`, so a note in a subfolder was indexed under a name the app could then
+/// never open. Elsewhere a backslash is an ordinary file name character and is
+/// left alone.
+pub fn note_key(relative: &std::path::Path) -> String {
+    let name = relative.to_string_lossy();
+    if cfg!(windows) {
+        normalize_separators(&name)
+    } else {
+        name.into_owned()
+    }
+}
+
+#[cfg(test)]
+mod note_key_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn backslashes_become_forward_slashes() {
+        assert_eq!(
+            normalize_separators("work\\acme\\kickoff.md"),
+            "work/acme/kickoff.md"
+        );
+        assert_eq!(normalize_separators("work/acme.md"), "work/acme.md");
+        assert_eq!(normalize_separators("plain.md"), "plain.md");
+    }
+
+    #[test]
+    fn a_relative_path_keeps_its_folders() {
+        let relative = Path::new("work").join("kickoff.md");
+
+        assert_eq!(note_key(&relative), "work/kickoff.md");
+    }
+
+    #[test]
+    fn a_flat_note_is_just_its_file_name() {
+        assert_eq!(note_key(Path::new("todo.txt")), "todo.txt");
+    }
+}

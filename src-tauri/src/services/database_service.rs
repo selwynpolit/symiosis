@@ -2,6 +2,7 @@ use crate::{
     core::{state::AppState, AppError, AppResult},
     database::with_db,
     logging::log,
+    utilities::paths::note_key,
 };
 use rusqlite::{params, Connection};
 use std::{
@@ -110,7 +111,7 @@ fn scan_filesystem_for_notes(notes_dir: &Path) -> rusqlite::Result<Vec<(String, 
         if entry.file_type().is_file() {
             let path = entry.path();
             let relative = path.strip_prefix(notes_dir).unwrap_or(path);
-            let filename = relative.to_string_lossy().to_string();
+            let filename = note_key(relative);
 
             if filename.contains("/.") || filename.starts_with('.') {
                 continue;
@@ -413,7 +414,7 @@ pub fn quick_filesystem_sync_check(app_state: &AppState) -> AppResult<bool> {
             .filter(|e| {
                 let path = e.path();
                 let relative = path.strip_prefix(&notes_dir).unwrap_or(path);
-                let filename = relative.to_string_lossy().to_string();
+                let filename = note_key(relative);
 
                 // Skip hidden files/folders (same logic as main app)
                 if filename.contains("/.") || filename.starts_with('.') {
@@ -436,7 +437,7 @@ pub fn quick_filesystem_sync_check(app_state: &AppState) -> AppResult<bool> {
             let relative_path = file_path.strip_prefix(&notes_dir).map_err(|e| {
                 AppError::InvalidPath(format!("Failed to get relative path: {}", e))
             })?;
-            let filename = relative_path.to_string_lossy().to_string();
+            let filename = note_key(relative_path);
 
             let file_content = match std::fs::read_to_string(file_path) {
                 Ok(content) => content,
