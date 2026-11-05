@@ -5,6 +5,9 @@ name: 'build-windows'
 # Rust toolchain there. Start it from the Actions tab: Run workflow.
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - 'nv-fixes'
 
 jobs:
   windows:
