@@ -78,6 +78,10 @@ pub(crate) fn lowercase_ascii_into(buf: &mut String, text: &str) {
 /// operator, so `foo-bar*` parses as a column filter and the whole query errors
 /// with "no such column". Quoting neutralises it, and for terms without `-` the
 /// quoted and unquoted forms match identically.
+///
+/// Terms are joined with AND: a note has to contain every word, in any order,
+/// and typing another word narrows the list. Joining with OR made each extra
+/// word widen the candidate set instead.
 pub(crate) fn build_fts_pattern(sanitized_query: &str) -> String {
     let quoted = |word: &str| format!("\"{}\"*", word);
 
@@ -87,10 +91,61 @@ pub(crate) fn build_fts_pattern(sanitized_query: &str) -> String {
             .filter(|word| !word.trim().is_empty())
             .map(quoted)
             .collect::<Vec<_>>()
-            .join(" OR ")
+            .join(" AND ")
     } else {
         quoted(sanitized_query)
     }
+}
+
+/// The lowercase words a note has to contain to match `query`.
+///
+/// Built from the sanitised query so it agrees with what FTS5 was asked for:
+/// punctuation FTS5 never sees, and the bare words AND/OR/NOT/NEAR/MATCH that
+/// the sanitiser removes as operators, are not required to appear in the note.
+pub(crate) fn query_words(query: &str) -> Vec<String> {
+    sanitize_fts_query(query)
+        .to_lowercase()
+        .split_whitespace()
+        .map(|word| word.trim_matches('*'))
+        .filter(|word| !word.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// A note's file name without its note extension: `a-b.md` is `a-b`.
+fn without_note_extension(filename_lower: &str) -> &str {
+    [".markdown", ".md", ".txt"]
+        .iter()
+        .find_map(|ext| filename_lower.strip_suffix(ext))
+        .unwrap_or(filename_lower)
+}
+
+/// Content score when every word appears in the title, the file name or the
+/// body, otherwise `None`. Everything passed in is already lowercase.
+///
+/// Substring match, as in nvALT: `ount` finds `account`. A word found only in
+/// the title or file name still counts once, so a note called "Acme" whose body
+/// never repeats the name is found by "acme invoice".
+fn word_coverage_score(
+    words: &[String],
+    title_lower: &str,
+    filename_lower: &str,
+    content_lower: &str,
+) -> Option<u32> {
+    let name_lower = without_note_extension(filename_lower);
+    let mut score = 50u32;
+
+    for word in words {
+        let in_body = content_lower.matches(word.as_str()).count() as u32;
+        let in_name = title_lower.contains(word.as_str()) || name_lower.contains(word.as_str());
+
+        if in_body == 0 && !in_name {
+            return None;
+        }
+        score = score.saturating_add(in_body.max(1).saturating_mul(10));
+    }
+
+    Some(score)
 }
 
 impl HybridSearcher {
@@ -182,30 +237,70 @@ impl HybridSearcher {
         candidate: &SearchCandidate,
         query: &str,
     ) -> Option<SearchResult> {
-        let query_lower = query.to_lowercase();
+        let words = query_words(query);
+        if words.is_empty() {
+            return None;
+        }
+
+        let query_lower = query.trim().to_lowercase();
         let title_lower = candidate.title.to_lowercase();
         let filename_lower = candidate.filename.to_lowercase();
 
-        if let Some((score, match_type)) =
-            self.score_title_match(&title_lower, &filename_lower, &query_lower)
-        {
-            Some(SearchResult {
-                filename: candidate.filename.clone(),
-                title: candidate.title.clone(),
-                score,
-                match_type,
-                modified: candidate.modified,
-            })
+        // The note body is lowercased once per candidate: it decides whether the
+        // note matches at all, whatever its title looks like.
+        //
+        // Unicode lowercasing is context-sensitive, so non-ASCII keeps one
+        // `to_lowercase`. ASCII lowercases in place into a buffer reused across
+        // candidates; `to_lowercase()` there allocated a fresh copy of every
+        // body on every keystroke. The buffer is taken out of `self` so the
+        // scorer below can still borrow `self` mutably.
+        let mut buf = std::mem::take(&mut self.lowercase_buf);
+        let unicode_lowered;
+        let content_lower: &str = if candidate.content.is_ascii() {
+            lowercase_ascii_into(&mut buf, &candidate.content);
+            &buf
         } else {
-            self.score_content_match(&candidate.content, &query_lower)
-                .map(|score| SearchResult {
-                    filename: candidate.filename.clone(),
-                    title: candidate.title.clone(),
-                    score,
-                    match_type: MatchType::Content,
-                    modified: candidate.modified,
-                })
-        }
+            unicode_lowered = candidate.content.to_lowercase();
+            &unicode_lowered
+        };
+
+        let result = self.score_lowered_candidate(
+            candidate,
+            &query_lower,
+            &words,
+            &title_lower,
+            &filename_lower,
+            content_lower,
+        );
+        self.lowercase_buf = buf;
+        result
+    }
+
+    fn score_lowered_candidate(
+        &mut self,
+        candidate: &SearchCandidate,
+        query_lower: &str,
+        words: &[String],
+        title_lower: &str,
+        filename_lower: &str,
+        content_lower: &str,
+    ) -> Option<SearchResult> {
+        // Every word has to be somewhere in the note. Without this gate the
+        // title rules below, which are fuzzy, could surface a note that does
+        // not contain the query at all.
+        let content_score = word_coverage_score(words, title_lower, filename_lower, content_lower)?;
+
+        let (score, match_type) = self
+            .score_title_match(title_lower, filename_lower, query_lower, words)
+            .unwrap_or((content_score, MatchType::Content));
+
+        Some(SearchResult {
+            filename: candidate.filename.clone(),
+            title: candidate.title.clone(),
+            score,
+            match_type,
+            modified: candidate.modified,
+        })
     }
 
     fn score_title_match(
@@ -213,6 +308,7 @@ impl HybridSearcher {
         title_lower: &str,
         filename_lower: &str,
         query_lower: &str,
+        words: &[String],
     ) -> Option<(u32, MatchType)> {
         for (text, boost) in [(title_lower, 100), (filename_lower, 50)] {
             if text == query_lower {
@@ -223,12 +319,25 @@ impl HybridSearcher {
                 return Some((800 + boost, MatchType::PrefixTitle));
             }
 
-            if text
+            let text_words: Vec<&str> = text
                 .split(|c: char| "_-.,+=;: ".contains(c) || c.is_whitespace())
                 .filter(|s| !s.is_empty())
-                .any(|word| word.starts_with(query_lower))
-            {
+                .collect();
+
+            if text_words.iter().any(|word| word.starts_with(query_lower)) {
                 return Some((700 + boost, MatchType::PrefixTitle));
+            }
+
+            // A multi-word query starts every word of the title in any order:
+            // "inv acme" finds "Acme Invoice Q3".
+            if words.len() > 1
+                && words.iter().all(|query_word| {
+                    text_words
+                        .iter()
+                        .any(|word| word.starts_with(query_word.as_str()))
+                })
+            {
+                return Some((650 + boost, MatchType::PrefixTitle));
             }
 
             if let Some(score) = self.fuzzy_match(text, query_lower) {
@@ -241,42 +350,19 @@ impl HybridSearcher {
         None
     }
 
-    fn score_lowered(&mut self, lowered: &str, query_lower: &str) -> Option<u32> {
-        if lowered.contains(query_lower) {
-            let count = lowered.matches(query_lower).count() as u32;
-            Some(50 + count * 10)
-        } else {
-            self.fuzzy_match(lowered, query_lower)
-        }
-    }
-
-    fn score_content_match(&mut self, content: &str, query_lower: &str) -> Option<u32> {
-        // Unicode lowercasing is context-sensitive, so non-ASCII keeps exactly
-        // what it did before — one `to_lowercase`, no buffer, no extra copy.
-        if !content.is_ascii() {
-            let lowered = content.to_lowercase();
-            return self.score_lowered(&lowered, query_lower);
-        }
-
-        // ASCII lowercases in place into a buffer reused across candidates.
-        // `to_lowercase()` here allocated a fresh copy of the whole note body
-        // for every candidate that missed on title, on every keystroke — on a
-        // 2000-note vault, megabytes of churn per key press.
-        // Taken out of `self` so `score_lowered` can still borrow mutably.
-        let mut buf = std::mem::take(&mut self.lowercase_buf);
-        lowercase_ascii_into(&mut buf, content);
-        let score = self.score_lowered(&buf, query_lower);
-        self.lowercase_buf = buf;
-        score
-    }
-
+    /// Fuzzy score of `needle` within `text`.
+    ///
+    /// `nucleo_matcher::Matcher::fuzzy_match` takes the haystack first and the
+    /// needle second. This used to pass them the other way round, which asks
+    /// whether the *note* is a subsequence of the *query*, so a fuzzy match
+    /// practically never happened.
     fn fuzzy_match(&mut self, text: &str, query: &str) -> Option<u32> {
         let mut haystack_buf = Vec::new();
         let mut needle_buf = Vec::new();
         let haystack = Utf32Str::new(text, &mut haystack_buf);
         let needle = Utf32Str::new(query, &mut needle_buf);
         self.matcher
-            .fuzzy_match(needle, haystack)
+            .fuzzy_match(haystack, needle)
             .map(|score| score as u32)
     }
 
@@ -318,4 +404,122 @@ pub fn search_notes_hybrid(
     let mut searcher =
         HybridSearcher::new().map_err(|e| AppError::DatabaseConnection(e.to_string()))?;
     searcher.search(app_state, query, max_results)
+}
+
+#[cfg(test)]
+mod scoring_tests {
+    use super::*;
+
+    fn candidate(filename: &str, content: &str) -> SearchCandidate {
+        SearchCandidate {
+            filename: filename.to_string(),
+            title: extract_title_from_content(content)
+                .unwrap_or_else(|| extract_title_from_filename(filename)),
+            content: content.to_string(),
+            modified: 0,
+        }
+    }
+
+    fn score(candidate: &SearchCandidate, query: &str) -> Option<SearchResult> {
+        HybridSearcher::new()
+            .expect("matcher should build")
+            .score_candidate(candidate, query)
+    }
+
+    const FAR_APART: &str = "Acme kickoff\n\nLots of unrelated text about the project plan and \
+                             the roadmap for next quarter.\n\nMuch later: the invoice was sent.";
+
+    #[test]
+    fn fuzzy_match_takes_the_haystack_first() {
+        let mut searcher = HybridSearcher::new().unwrap();
+
+        // The needle is a subsequence of the haystack, not the other way round.
+        assert!(searcher.fuzzy_match("account balance", "ount").is_some());
+        assert!(searcher.fuzzy_match("ount", "account balance").is_none());
+    }
+
+    #[test]
+    fn every_word_must_be_present_but_not_next_to_each_other() {
+        let note = candidate("acme.md", FAR_APART);
+
+        let hit = score(&note, "acme invoice").expect("both words are in the note");
+        assert_eq!(hit.match_type, MatchType::Content);
+    }
+
+    #[test]
+    fn word_order_in_the_query_does_not_matter() {
+        let note = candidate("acme.md", FAR_APART);
+
+        assert!(score(&note, "invoice acme").is_some());
+    }
+
+    #[test]
+    fn a_missing_word_rules_the_note_out() {
+        let note = candidate("acme.md", "Acme kickoff\n\nRoadmap and pricing only.");
+
+        assert!(score(&note, "acme invoice").is_none());
+    }
+
+    #[test]
+    fn a_word_that_is_not_in_the_note_never_matches_by_fuzziness() {
+        // z, e, b, r, a all occur in order, so a fuzzy matcher would accept it.
+        let note = candidate("plain.md", "the lazy dog zips by every bright rainbow area");
+
+        assert!(score(&note, "zebra").is_none());
+    }
+
+    #[test]
+    fn words_match_inside_other_words() {
+        let note = candidate("bank.md", "Bank\n\naccount balance");
+
+        assert!(score(&note, "ount").is_some());
+    }
+
+    #[test]
+    fn a_word_found_only_in_the_file_name_counts() {
+        let note = candidate("acme.md", "Invoice sent on Friday");
+
+        assert!(score(&note, "acme invoice").is_some());
+    }
+
+    #[test]
+    fn the_file_extension_is_not_part_of_the_name() {
+        let note = candidate("acme.md", "Acme\n\nroadmap");
+
+        assert!(score(&note, "md").is_none());
+        assert_eq!(without_note_extension("a-b.md"), "a-b");
+        assert_eq!(without_note_extension("a.markdown"), "a");
+        assert_eq!(without_note_extension("a.txt"), "a");
+        assert_eq!(without_note_extension("a.rs"), "a.rs");
+    }
+
+    #[test]
+    fn an_exact_title_still_outranks_a_content_hit() {
+        let titled = candidate("acme.md", "Acme");
+        let body = candidate("other.md", "Other\n\nmentions acme in passing");
+
+        let exact = score(&titled, "acme").unwrap();
+        let content = score(&body, "acme").unwrap();
+
+        assert_eq!(exact.match_type, MatchType::ExactTitle);
+        assert_eq!(content.match_type, MatchType::Content);
+        assert!(exact.match_type > content.match_type);
+    }
+
+    #[test]
+    fn every_word_can_start_a_word_of_the_title() {
+        let note = candidate("q3.md", "Acme Invoice Q3\n\nbody");
+
+        let hit = score(&note, "inv acme").expect("both words start title words");
+        assert_eq!(hit.match_type, MatchType::PrefixTitle);
+        assert_eq!(hit.score, 750);
+    }
+
+    #[test]
+    fn query_words_follow_the_sanitised_query() {
+        assert_eq!(query_words("Rock and roll"), vec!["rock", "roll"]);
+        assert_eq!(query_words("foo* bar,"), vec!["foo", "bar"]);
+        assert_eq!(query_words("  Acme   Invoice "), vec!["acme", "invoice"]);
+        assert!(query_words("AND OR").is_empty());
+    }
 }

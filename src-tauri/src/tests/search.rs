@@ -242,11 +242,13 @@ fn test_build_fts_pattern_quotes_every_term() {
     );
 
     assert_eq!(build_fts_pattern("databases"), "\"databases\"*");
+    // Words are ANDed: a note has to contain all of them, so each extra word
+    // narrows the results.
     assert_eq!(
         build_fts_pattern("comprehensive tips"),
-        "\"comprehensive\"* OR \"tips\"*"
+        "\"comprehensive\"* AND \"tips\"*"
     );
-    assert_eq!(build_fts_pattern("a-b c-d"), "\"a-b\"* OR \"c-d\"*");
+    assert_eq!(build_fts_pattern("a-b c-d"), "\"a-b\"* AND \"c-d\"*");
 }
 
 #[test]
@@ -407,7 +409,7 @@ fn test_lowercase_ascii_into_is_safe_to_reuse() {
 fn test_non_ascii_never_takes_the_ascii_path() {
     // These all lowercase differently under ASCII-only rules, so scoring must
     // route them to `to_lowercase`. Guards the `is_ascii` branch in
-    // `score_content_match`, which is what keeps Greek matching itself.
+    // `score_candidate`, which is what keeps Greek matching itself.
     // Note ß is deliberately absent: it lowercases identically under both
     // paths, so it could not tell them apart.
     for text in [
