@@ -6,6 +6,7 @@
 
 import { invoke } from '@tauri-apps/api/core'
 import { notification } from '../utils/notification'
+import { toNoteFileName } from '../utils/noteName'
 import type { NoteMetadata } from '../types/note'
 
 export function createNoteService() {
@@ -30,7 +31,10 @@ export function createNoteService() {
     state.lastOperation = 'create'
 
     try {
-      const finalNoteName = noteName.includes('.') ? noteName : `${noteName}.md`
+      const finalNoteName = toNoteFileName(noteName)
+      if (!finalNoteName) {
+        throw new Error('Note name has no usable characters')
+      }
       await invoke<void>('create_new_note', { noteName: finalNoteName })
       return { success: true, noteName: finalNoteName }
     } catch (e) {
@@ -79,7 +83,10 @@ export function createNoteService() {
     state.lastOperation = 'rename'
 
     try {
-      const finalNewName = newName.includes('.') ? newName : `${newName}.md`
+      const finalNewName = toNoteFileName(newName)
+      if (!finalNewName) {
+        throw new Error('Note name has no usable characters')
+      }
       await invoke<void>('rename_note', { oldName, newName: finalNewName })
       return { success: true, newName: finalNewName }
     } catch (e) {
