@@ -52,7 +52,8 @@ mod serial_tests {
                 || error_msg.contains("path was not found")
                 || error_msg.contains("No path was found")
                 || error_msg.contains("entity not found")
-                || error_msg.contains("cannot find the file"),
+                || error_msg.contains("cannot find the file")
+                || error_msg.contains("neither a file nor a directory"),
             "Error should indicate missing directory: {}",
             error_msg
         );
