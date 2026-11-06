@@ -37,8 +37,8 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --no-frozen-lockfile
 
-      # The suites run on Windows, which CI otherwise never does. A failure here
-      # is reported but does not stop the installers from being built.
+      # The suites run on Windows, which CI otherwise never does. Rust test
+      # failures stop the build; frontend failures are reported only.
       - name: Frontend tests
         run: pnpm test
         continue-on-error: true
@@ -46,7 +46,6 @@ jobs:
       - name: Rust tests
         working-directory: src-tauri
         run: cargo test --lib
-        continue-on-error: true
 
       - name: Build installers
         run: pnpm tauri build
