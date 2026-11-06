@@ -244,7 +244,14 @@ pub fn validate_note_name(note_name: &str) -> AppResult<()> {
         return Err(AppError::InvalidNoteName("Invalid note name".to_string()));
     }
 
-    if std::path::Path::new(note_name).is_absolute() {
+    // is_absolute() is false for "/x" on Windows, where join() would then
+    // resolve it to the drive root.
+    if std::path::Path::new(note_name).components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::RootDir | std::path::Component::Prefix(_)
+        )
+    }) {
         return Err(AppError::InvalidNoteName(
             "Absolute paths not allowed".to_string(),
         ));
